@@ -376,7 +376,7 @@ DroidMediaCamera *droid_media_camera_connect(int camera_number)
 
 #if ANDROID_MAJOR >= 9
     android::sp<DroidMediaBufferQueue>
-      recording_queue(new DroidMediaBufferQueue("DroidMediaCameraBufferRecordingQueue"));
+      recording_queue(new DroidMediaBufferQueue("DroidMediaCameraBufferRecordingQueue", false));
     if (!recording_queue->connectListener()) {
         ALOGE("Failed to connect video buffer queue listener");
     } else {

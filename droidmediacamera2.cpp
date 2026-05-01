@@ -2135,6 +2135,9 @@ static void update_request(DroidMediaCamera *camera, ACaptureRequest *request, s
             {
                 float value = 0.0f;
                 if (parse_float_value(value_s, value)) {
+                    if (value <= 0.0f) {
+                        value = 1.0f;
+                    }
                     ACaptureRequest_setEntry_float(request, key, 1, &value);
                 } else {
                     ALOGW("Ignoring invalid zoom ratio: %s", value_s.c_str());

@@ -281,14 +281,21 @@ static bool start_precapture_trigger(DroidMediaCamera *camera)
     }
 
     if (af_state == PRECAPTURE_STATE_IDLE) {
-        uint8_t afTrigger = ACAMERA_CONTROL_AF_TRIGGER_START;
-        status = ACaptureRequest_setEntry_u8(request,
-            ACAMERA_CONTROL_AF_TRIGGER, 1, &afTrigger);
-        if (status == ACAMERA_OK) {
-            af_state = PRECAPTURE_STATE_PENDING;
-            camera->m_af_precapture_result_count = 0;
-        } else {
-            ALOGW("Failed to set AF trigger to START");
+        ACameraMetadata_const_entry entry;
+        status = ACaptureRequest_getConstEntry(request, ACAMERA_CONTROL_AF_MODE, &entry);
+        if (status == ACAMERA_OK && entry.count > 0 && entry.data.u8[0] != ACAMERA_CONTROL_AF_MODE_OFF) {
+            uint8_t afTrigger = ACAMERA_CONTROL_AF_TRIGGER_START;
+            status = ACaptureRequest_setEntry_u8(request,
+                ACAMERA_CONTROL_AF_TRIGGER, 1, &afTrigger);
+            if (status == ACAMERA_OK) {
+                af_state = PRECAPTURE_STATE_PENDING;
+                camera->m_af_precapture_result_count = 0;
+            } else {
+                ALOGW("Failed to set AF trigger to START");
+            }
+        } else if (camera->m_cb.focus_cb) {
+            ALOGI("skipping AF because it is disabled");
+            camera->m_cb.focus_cb(camera->m_cb_data, 1);
         }
     }
 
@@ -393,15 +400,16 @@ static bool continue_still_capture(DroidMediaCamera *camera)
         return submit_still_capture_request(camera);
     }
 
-    if (camera->m_ae_precapture_state == PRECAPTURE_STATE_LOCKED &&
-            camera->m_af_precapture_state == PRECAPTURE_STATE_LOCKED) {
-        ALOGD("All precapture sequences done, starting capture");
-        return submit_still_capture_request(camera);
+    if (camera->m_ae_precapture_state == PRECAPTURE_STATE_PENDING ||
+            camera->m_ae_precapture_state == PRECAPTURE_STATE_BUSY ||
+            camera->m_af_precapture_state == PRECAPTURE_STATE_PENDING ||
+            camera->m_af_precapture_state == PRECAPTURE_STATE_BUSY) {
+        ALOGD("Waiting for precapture to complete");
+        return true;
     }
 
-    ALOGD("Waiting for precapture to complete");
-
-    return true;
+    ALOGD("All precapture sequences done, starting capture");
+    return submit_still_capture_request(camera);
 }
 
 static void finish_auto_focus(DroidMediaCamera *camera, int result)

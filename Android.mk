@@ -93,6 +93,13 @@ LOCAL_SHARED_LIBRARIES := libc \
                           libstagefright_foundation \
                           libmedia
 
+ifeq ($(shell test $(ANDROID_MAJOR) -ge 9 && echo true),true)
+LOCAL_SRC_FILES += droidmediaphotoplugin2.cpp
+LOCAL_SHARED_LIBRARIES += libcamera2ndk \
+                          libmediandk \
+                          libnativewindow
+endif
+
 ifeq ($(shell test $(ANDROID_MAJOR) -ge 8 && echo true),true)
 LOCAL_SHARED_LIBRARIES += liblog
 endif
@@ -121,9 +128,12 @@ LOCAL_CPPFLAGS=-DANDROID_MAJOR=$(ANDROID_MAJOR) -DANDROID_MINOR=$(ANDROID_MINOR)
 LOCAL_MODULE_TAGS := optional
 LOCAL_MODULE := libdroidmedia
 
+LOCAL_C_INCLUDES := external/droidmedia/camera-api/lib
+
 ifeq ($(shell test $(ANDROID_MAJOR) -ge 7 && echo true),true)
-LOCAL_C_INCLUDES := frameworks/native/include/media/openmax \
-                    frameworks/native/include/media/hardware
+LOCAL_C_INCLUDES += frameworks/native/include/media/openmax \
+                    frameworks/native/include/media/hardware \
+                    frameworks/av/camera/ndk/include
 ifeq ($(shell test $(ANDROID_MAJOR) -ge 8 && echo true),true)
 LOCAL_C_INCLUDES += frameworks/native/libs/nativewindow/include \
                     frameworks/av/media/libstagefright/omx/include \
@@ -135,7 +145,7 @@ LOCAL_C_INCLUDES += frameworks/av/media/libmediametrics/include \
                     frameworks/av/drm/libmediadrm/interface
 endif
 else
-LOCAL_C_INCLUDES := frameworks/native/include/media/openmax
+LOCAL_C_INCLUDES += frameworks/native/include/media/openmax
 endif
 
 ifeq ($(ANDROID_MAJOR),$(filter $(ANDROID_MAJOR),9))

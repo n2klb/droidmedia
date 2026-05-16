@@ -10,14 +10,22 @@ cc = meson.get_compiler('c')
 
 root_dir = include_directories('.')
 
+egl_dep = dependency('egl', required: true)
+photo_api_dep = dependency('photo-api-0.1', required: true)
+
 droidmedia_source = [
   'hybris.c',
+]
+
+droidmedia_deps = [
+  photo_api_dep,
+  cc.find_library('dl', required : true),
 ]
 
 libdroidmedia_a = static_library('droidmedia',
                                  droidmedia_source,
                                  install: true,
-                                 dependencies: cc.find_library('dl', required : true))
+                                 dependencies: droidmedia_deps)
 
 droidmedia_headers = [
     'droidmediacamera.h',
@@ -35,3 +43,16 @@ pkg = import('pkgconfig')
 pkg.generate(libdroidmedia_a,
              libraries: ['-ldl'],
              subdirs: ['droidmedia'])
+
+photoplugin_dir = photo_api_dep.get_variable('plugin_dir')
+
+photoplugin_source = [
+  'hybris-photoplugin.c',
+]
+
+shared_module('photoplugin-droid2',
+              photoplugin_source,
+              install: true,
+              link_with: [libdroidmedia_a],
+              dependencies: [egl_dep, photo_api_dep],
+              install_dir: photoplugin_dir)

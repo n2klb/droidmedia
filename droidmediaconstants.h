@@ -90,6 +90,7 @@ typedef struct {
   int OMX_COLOR_Format32bitBGRA8888;
   int OMX_COLOR_Format16bitRGB565;
   int OMX_COLOR_Format16bitBGR565;
+  int OMX_COLOR_FormatAndroidOpaque;
   int OMX_COLOR_FormatYUV420Flexible;
 } DroidMediaColourFormatConstants;
 

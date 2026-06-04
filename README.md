@@ -23,5 +23,6 @@ bp2 -b external/droidmedia -s rpm/droidmedia-devel.spec
 ```
 
 Finally, to test this with existing camera applications, build the `photo-api` branch of
-<https://github.com/n2klb/qtmultimedia>. On the device, set the `QT_GSTREAMER_CAMERABIN_SRC`
+<https://github.com/n2klb/qtmultimedia>. For video recording, also build the `photo-droidvenc`
+branch of <https://github.com/n2klb/gst-droid>. On the device, set the `QT_GSTREAMER_CAMERABIN_SRC`
 environment variable to `photocamerasrc` in /var/lib/environment/nemo/60-multimedia.conf.

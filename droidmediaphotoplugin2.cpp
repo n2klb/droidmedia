@@ -28,6 +28,7 @@
 #include <gui/BufferQueue.h>
 #include <gui/Surface.h>
 #include <hardware/camera2.h>
+#include <media/MediaProfiles.h>
 #include <media/NdkImage.h>
 #include <media/hardware/HardwareAPI.h>
 #include <media/openmax/OMX_IVCommon.h>
@@ -114,6 +115,9 @@ struct DroidMediaPhotoCamera : public PhotoBackendCamera {
     bool ae_unlock_wait_lock = false;
     bool af_active_scan = false;
     std::deque<DroidMediaPhotoStream *> stopping_streams;
+
+    int max_video_width = 0;
+    int max_video_height = 0;
 
     // Callbacks
     ACameraDevice_StateCallbacks device_state_callbacks;
@@ -560,7 +564,13 @@ static void dmp_stream_enumerate_configs(PhotoStream *pstream, const PhotoConfig
     ACameraMetadata_const_entry entry;
     camera_status_t status;
 
+    int32_t max_width = INT32_MAX, max_height = INT32_MAX;
     int32_t recommended_format = -1;
+
+    if (pstream->usage == PHOTO_STREAM_USAGE_RECORDING) {
+        max_width = camera->max_video_width;
+        max_height = camera->max_video_height;
+    }
 
     info->native_format = "com.android.ANativeWindowBuffer";
 
@@ -628,12 +638,14 @@ static void dmp_stream_enumerate_configs(PhotoStream *pstream, const PhotoConfig
             ACAMERA_SCALER_AVAILABLE_STREAM_CONFIGURATIONS, &entry);
     if (status == ACAMERA_OK) {
         for (int i = 0; i < entry.count; i += 4) {
+            int32_t format = entry.data.i32[i + 0];
+            int32_t width = entry.data.i32[i + 1];
+            int32_t height = entry.data.i32[i + 2];
+
             if (entry.data.i32[i + 3]) {
                 // ignore input formats
                 continue;
             }
-
-            int32_t format = entry.data.i32[i + 0];
 
             bool format_valid = true;
 
@@ -650,14 +662,15 @@ static void dmp_stream_enumerate_configs(PhotoStream *pstream, const PhotoConfig
                 }
             }
 
-            if (!format_valid || !convert_format(format, &info->format)) {
+            if (!format_valid || !convert_format(format, &info->format) ||
+                    width > max_width || height > max_height) {
                 continue;
             }
 
-            info->width.min = entry.data.i32[i + 1];
-            info->width.max = entry.data.i32[i + 1];
-            info->height.min = entry.data.i32[i + 2];
-            info->height.max = entry.data.i32[i + 2];
+            info->width.min = width;
+            info->width.max = width;
+            info->height.min = height;
+            info->height.max = height;
 
             enumerate_fps_ranges(stream, filter, cb, userdata, flags, info);
         }
@@ -1939,6 +1952,52 @@ bool droid_media_photo_plugin_init(const DroidMediaPhotoInterface *interface)
     ACameraIdList *camera_id_list = NULL;
     ACameraManager *camera_manager = ACameraManager_create();
 
+    struct {
+        int max_width = 0;
+        int max_height = 0;
+    } video_info;
+
+    // Based on frameworks/av/services/camera/libcameraservice/api1/client2/Parameters.cpp
+    // Treat the H.264 max size as the max supported video size.
+    // At some point, Android started using relative search paths for the
+    // media profile XML files, which is why we need this hack to change to
+    // the root directory before listing them.
+    int pipefd[2];
+    if (pipe2(pipefd, O_CLOEXEC) < 0) {
+        ALOGE("pipe2() failed");
+    } else {
+        int ret = fork();
+        if (ret == 0) {
+            chdir("/");
+            android::MediaProfiles *profiles = android::MediaProfiles::getInstance();
+            android::Vector<android::video_encoder> encoders = profiles->getVideoEncoders();
+            for (size_t i = 0; i < encoders.size(); i++) {
+                int width = profiles->getVideoEncoderParamByName("enc.vid.width.max", encoders[i]);
+                int height = profiles->getVideoEncoderParamByName("enc.vid.height.max", encoders[i]);
+                if (width > video_info.max_width) {
+                    video_info.max_width = width;
+                }
+                if (height > video_info.max_height) {
+                    video_info.max_height = height;
+                }
+            }
+            write(pipefd[1], &video_info, sizeof(video_info));
+            _exit(0);
+        } else if (ret > 0) {
+            // Note that this will hang if the child process crashes.
+            if (read(pipefd[0], &video_info, sizeof(video_info)) != sizeof(video_info)) {
+                ALOGE("read() from pipe failed");
+            }
+        } else {
+            ALOGE("fork() failed");
+        }
+        close(pipefd[0]);
+        close(pipefd[1]);
+    }
+
+    ALOGD("Maximum supported video size: %dx%d",
+          video_info.max_width, video_info.max_height);
+
     status = ACameraManager_getCameraIdList(camera_manager, &camera_id_list);
     if (status != ACAMERA_OK) {
         ALOGE("Failed to get camera id list: %d", status);
@@ -1950,6 +2009,8 @@ bool droid_media_photo_plugin_init(const DroidMediaPhotoInterface *interface)
         const char *id = camera_id_list->cameraIds[i];
 
         camera->plugin_interface = interface;
+        camera->max_video_width = video_info.max_width;
+        camera->max_video_height = video_info.max_height;
         status = ACameraManager_getCameraCharacteristics(camera_manager, id, &camera->metadata);
         if (status == ACAMERA_OK) {
             interface->register_camera(camera, id, &dmp_camera_impl);

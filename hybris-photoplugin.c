@@ -14,8 +14,10 @@ static DroidMediaPhotoInterface droid_media_photo_interface = {
     .notify_shutter = photo_backend_notify_shutter,
     .notify_capture = photo_backend_notify_capture,
     .notify_disconnected = photo_backend_notify_disconnected,
-    .init_buffer = photo_backend_init_buffer,
     .frame_available = photo_backend_frame_available,
+    .stream_stopped = photo_backend_stream_stopped,
+    .init_buffer = photo_backend_init_buffer,
+    .bind_buffer = photo_backend_bind_buffer,
     .unbind_buffer = photo_backend_unbind_buffer,
 };
 

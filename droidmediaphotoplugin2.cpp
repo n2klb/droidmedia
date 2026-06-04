@@ -29,7 +29,7 @@
 #include <gui/Surface.h>
 #include <hardware/camera2.h>
 #include <media/NdkImage.h>
-#include <media/hardware/MetadataBufferType.h>
+#include <media/hardware/HardwareAPI.h>
 #include <media/openmax/OMX_IVCommon.h>
 
 #if ANDROID_MAJOR <= 9
@@ -43,13 +43,14 @@ typedef ANativeWindow ACameraWindowType;
 #define LOG_TAG "DroidMediaPhotoPlugin"
 
 namespace {
-constexpr int kNumCaptureBuffers = 4;
+constexpr int kMaxAcquiredBuffers = android::BufferQueue::NUM_BUFFER_SLOTS / 2;
 }
 
 struct DroidMediaPhotoBuffer : public PhotoBackendBuffer {
     int slot;
     int frame_number;
     android::sp<android::GraphicBuffer> graphic_buffer;
+    android::VideoNativeMetadata metadata;
 };
 
 struct DroidMediaPhotoStream;
@@ -88,6 +89,8 @@ struct DroidMediaPhotoStream : public PhotoBackendStream {
     android::sp<ANativeWindow> window;
     android::Mutex slot_lock;
     DroidMediaPhotoBufferSlot slots[android::BufferQueue::NUM_BUFFER_SLOTS];
+
+    int sequence_id = -1;
 };
 
 struct DroidMediaPhotoCamera : public PhotoBackendCamera {
@@ -110,6 +113,7 @@ struct DroidMediaPhotoCamera : public PhotoBackendCamera {
     bool ae_unlock = false;
     bool ae_unlock_wait_lock = false;
     bool af_active_scan = false;
+    std::deque<DroidMediaPhotoStream *> stopping_streams;
 
     // Callbacks
     ACameraDevice_StateCallbacks device_state_callbacks;
@@ -332,7 +336,7 @@ static bool setup_stream(DroidMediaPhotoCamera *camera, PhotoStream *pstream,
 
     android::BufferQueue::createBufferQueue(&stream->producer, &stream->consumer);
 
-    stream->consumer->setMaxAcquiredBufferCount(kNumCaptureBuffers);
+    stream->consumer->setMaxAcquiredBufferCount(kMaxAcquiredBuffers);
     stream->consumer->setConsumerName(android::String8("PhotoStream"));
     stream->consumer->setConsumerUsageBits(usage);
     stream->consumer->setDefaultBufferFormat(format);
@@ -461,11 +465,23 @@ static bool update_repeating_request(DroidMediaPhotoCamera *camera)
     ACaptureRequest_setEntry_i32(camera->repeating_request, ACAMERA_CONTROL_AE_TARGET_FPS_RANGE,
                                  2, fps_range);
 
+    android::AutoMutex lock(camera->droid_sequence_lock);
+
+    int seq_id = -1;
     camera_status_t status = ACameraCaptureSession_setRepeatingRequest(camera->session,
-            &camera->capture_callbacks, 1, &camera->repeating_request, NULL);
+            &camera->capture_callbacks, 1, &camera->repeating_request, &seq_id);
     if (status != ACAMERA_OK) {
         ALOGE("Failed to set repeating request");
         return false;
+    }
+
+    for (int i = 0; i < pcamera->num_streams; i++) {
+        PhotoStream *pstream = pcamera->streams[i];
+        DroidMediaPhotoStream *stream = static_cast<DroidMediaPhotoStream *>(pstream->backend);
+
+        if (pstream->running) {
+            stream->sequence_id = seq_id;
+        }
     }
 
     return true;
@@ -536,17 +552,17 @@ static void enumerate_fps_ranges(DroidMediaPhotoStream *stream, const PhotoConfi
 
 static void dmp_stream_enumerate_configs(PhotoStream *pstream, const PhotoConfig *filter,
                                          PhotoConfigIteratorCallback cb, void *userdata,
-                                         PhotoStreamConfigFlags flags)
+                                         PhotoStreamConfigFlags flags, PhotoAvailableConfig *info)
 {
     DroidMediaPhotoCamera *camera = static_cast<DroidMediaPhotoCamera *>(pstream->camera->backend);
     DroidMediaPhotoStream *stream = static_cast<DroidMediaPhotoStream *>(pstream->backend);
-
-    PhotoAvailableConfig info;
 
     ACameraMetadata_const_entry entry;
     camera_status_t status;
 
     int32_t recommended_format = -1;
+
+    info->native_format = "com.android.ANativeWindowBuffer";
 
     if (flags & PHOTO_STREAM_CONFIG_RECOMMENDED) {
         int stream_usecase = ACAMERA_SCALER_AVAILABLE_RECOMMENDED_STREAM_CONFIGURATIONS_PREVIEW;
@@ -573,16 +589,16 @@ static void dmp_stream_enumerate_configs(PhotoStream *pstream, const PhotoConfig
                 int usecases = entry.data.i32[i + 4];
 
                 if (usecases & (1 << stream_usecase)) {
-                    if (!convert_format(entry.data.i32[i + 2], &info.format)) {
+                    if (!convert_format(entry.data.i32[i + 2], &info->format)) {
                         continue;
                     }
 
-                    info.width.min = entry.data.i32[i + 0];
-                    info.width.max = entry.data.i32[i + 0];
-                    info.height.min = entry.data.i32[i + 1];
-                    info.height.max = entry.data.i32[i + 1];
+                    info->width.min = entry.data.i32[i + 0];
+                    info->width.max = entry.data.i32[i + 0];
+                    info->height.min = entry.data.i32[i + 1];
+                    info->height.max = entry.data.i32[i + 1];
 
-                    enumerate_fps_ranges(stream, filter, cb, userdata, flags, &info);
+                    enumerate_fps_ranges(stream, filter, cb, userdata, flags, info);
                 }
             }
 
@@ -634,16 +650,16 @@ static void dmp_stream_enumerate_configs(PhotoStream *pstream, const PhotoConfig
                 }
             }
 
-            if (!format_valid || !convert_format(format, &info.format)) {
+            if (!format_valid || !convert_format(format, &info->format)) {
                 continue;
             }
 
-            info.width.min = entry.data.i32[i + 1];
-            info.width.max = entry.data.i32[i + 1];
-            info.height.min = entry.data.i32[i + 2];
-            info.height.max = entry.data.i32[i + 2];
+            info->width.min = entry.data.i32[i + 1];
+            info->width.max = entry.data.i32[i + 1];
+            info->height.min = entry.data.i32[i + 2];
+            info->height.max = entry.data.i32[i + 2];
 
-            enumerate_fps_ranges(stream, filter, cb, userdata, flags, &info);
+            enumerate_fps_ranges(stream, filter, cb, userdata, flags, info);
         }
     } else {
         ALOGE("Failed to get any supported configurations");
@@ -712,6 +728,10 @@ static void dmp_stream_stop(PhotoStream *pstream)
     ACaptureRequest_removeTarget(camera->video_snapshot_request, stream->output_target);
 
     update_repeating_request(camera);
+
+    android::AutoMutex lock(camera->droid_sequence_lock);
+    ALOGD("stream will stop with sequence ID %d", stream->sequence_id);
+    camera->stopping_streams.push_back(stream);
 }
 
 static bool dmp_stream_take_picture(PhotoStream *pstream)
@@ -860,6 +880,15 @@ static DroidMediaPhotoBuffer *new_buffer_from_item(DroidMediaPhotoStream *stream
                                                &dmp_buffer_impl)) {
         return nullptr;
     }
+
+    buffer->metadata.eType = android::kMetadataBufferTypeANWBuffer;
+    buffer->metadata.pBuffer = buffer->graphic_buffer->getNativeBuffer();
+    buffer->metadata.nFenceFd = -1;
+
+    buffer->photo_buffer->info->native_metadata = &buffer->metadata;
+    buffer->photo_buffer->info->native_metadata_size = sizeof(buffer->metadata);
+
+    camera->plugin_interface->bind_buffer(buffer);
 
     return buffer;
 
@@ -1208,9 +1237,16 @@ static void capture_session_on_capture_sequence_completed(
     ALOGD("capture sequence completed: %d", sequenceId);
 
     android::AutoMutex lock(camera->droid_sequence_lock);
+
     if (sequenceId == camera->picture_seq_id) {
         camera->picture_seq_id = -1;
         camera->plugin_interface->notify_capture(camera, true);
+    }
+
+    while (!camera->stopping_streams.empty() &&
+            camera->stopping_streams.front()->sequence_id == sequenceId) {
+        camera->plugin_interface->stream_stopped(camera->stopping_streams.front());
+        camera->stopping_streams.pop_front();
     }
 }
 
@@ -1222,9 +1258,16 @@ static void capture_session_on_capture_sequence_abort(
     ALOGW("capture sequence aborted: %d", sequenceId);
 
     android::AutoMutex lock(camera->droid_sequence_lock);
+
     if (sequenceId == camera->picture_seq_id) {
         camera->picture_seq_id = -1;
         camera->plugin_interface->notify_capture(camera, false);
+    }
+
+    while (!camera->stopping_streams.empty() &&
+            camera->stopping_streams.front()->sequence_id == sequenceId) {
+        camera->plugin_interface->stream_stopped(camera->stopping_streams.front());
+        camera->stopping_streams.pop_front();
     }
 }
 
@@ -1853,6 +1896,15 @@ static void dmp_camera_release_streams(PhotoCamera *pcamera)
     if (camera->session) {
         ACameraCaptureSession_close(camera->session);
         camera->session = NULL;
+    }
+
+    {
+        android::AutoMutex lock(camera->droid_sequence_lock);
+
+        while (!camera->stopping_streams.empty()) {
+            camera->plugin_interface->stream_stopped(camera->stopping_streams.front());
+            camera->stopping_streams.pop_front();
+        }
     }
 
     for (int i = 0; i < pcamera->num_streams; i++) {

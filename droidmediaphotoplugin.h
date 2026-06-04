@@ -38,10 +38,12 @@ typedef struct _DroidMediaPhotoInterface {
     void (*notify_shutter)(PhotoBackendCamera *camera);
     void (*notify_capture)(PhotoBackendCamera *camera, bool successful);
     void (*notify_disconnected)(PhotoBackendCamera *camera);
+    void (*frame_available)(PhotoBackendStream *stream);
+    void (*stream_stopped)(PhotoBackendStream *stream);
     bool (*init_buffer)(PhotoBackendStream *stream, PhotoBackendBuffer *buffer,
                         unsigned int num_planes, PhotoBufferPlaneInfo *planes,
                         const PhotoBufferImpl *impl);
-    void (*frame_available)(PhotoBackendStream *stream);
+    void (*bind_buffer)(PhotoBackendBuffer *buffer);
     void (*unbind_buffer)(PhotoBackendBuffer *buffer);
     PFNEGLCREATEIMAGEKHRPROC egl_create_image;
 } DroidMediaPhotoInterface;

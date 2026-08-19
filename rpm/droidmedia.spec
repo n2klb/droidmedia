@@ -30,6 +30,7 @@ License:       ASL 2.0
 BuildRequires: ubu-trusty
 BuildRequires: sudo-for-abuild
 BuildRequires: droid-bin-src-full
+BuildRequires: photo-api-devel
 Source0:       %{name}-%{version}.tgz
 AutoReqProv:   no
 
@@ -51,6 +52,8 @@ pushd external
 tar -zxf %SOURCE0
 mv droidmedia* droidmedia
 popd
+
+cp -r /usr/include/photo-api-* external/droidmedia/
 
 cat /dev/null > external/droidmedia/env.mk
 

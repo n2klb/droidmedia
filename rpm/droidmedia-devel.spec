@@ -6,6 +6,8 @@ License:       ASL 2.0
 Source0:       %{name}-%{version}.tgz
 BuildRequires: meson
 BuildRequires: ninja
+BuildRequires: photo-api-devel
+BuildRequires: pkgconfig(egl)
 BuildRequires: pkgconfig(Qt5Core)
 BuildRequires: pkgconfig(Qt5DBus)
 BuildRequires: pkgconfig(libresourceqt5) >= 1.29
@@ -22,6 +24,13 @@ Provides:      sailfish-flashlight-provider
 
 %description -n droidmedia-flashlight
 Android-backed implementation of the Jolla settings flashlight D-Bus service.
+
+%package -n photo-api-plugin-droid2
+Summary:       Android Camera2 API plugin
+Requires:      photo-api
+
+%description -n photo-api-plugin-droid2
+%{summary}
 
 %prep
 %setup -q
@@ -43,3 +52,6 @@ meson rewrite kwargs set project / version %{version}
 %files -n droidmedia-flashlight
 %{_bindir}/droidmedia-flashlight
 %{_datadir}/dbus-1/services/org.sailfish.flashlight.provider.service
+
+%files -n photo-api-plugin-droid2
+%{_libdir}/photo-plugins/libphotoplugin-droid2.so

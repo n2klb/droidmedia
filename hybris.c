@@ -20,6 +20,7 @@
 #include "droidmediacodec.h"
 #include "droidmediaconvert.h"
 #include "droidmediaconstants.h"
+#include "droidmediaphotoplugin.h"
 #include "droidmediarecorder.h"
 #include <dlfcn.h>
 #include <assert.h>
@@ -270,6 +271,8 @@ HYBRIS_WRAPPER_0_1(DroidMediaRecorder*,droid_media_recorder_destroy);
 HYBRIS_WRAPPER_1_1(bool,DroidMediaRecorder*,droid_media_recorder_start);
 HYBRIS_WRAPPER_0_1(DroidMediaRecorder*,droid_media_recorder_stop);
 HYBRIS_WRAPPER_0_3(DroidMediaRecorder*,DroidMediaCodecDataCallbacks*,void*,droid_media_recorder_set_data_callbacks);
+
+HYBRIS_WRAPPER_1_1(bool,const DroidMediaPhotoInterface*,droid_media_photo_plugin_init);
 
 bool droid_media_camera_set_torch_mode(bool enabled)
 {

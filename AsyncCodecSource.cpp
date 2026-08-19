@@ -471,11 +471,22 @@ void AsyncCodecSource::onMessageReceived(const sp<AMessage> &msg) {
             MediaBuffer     *buffer = new MediaBuffer(size);
             CHECK_LE(out_buffer->size(), buffer->size());
             memcpy(buffer->data(), out_buffer->data(), out_buffer->size());
+
 #if ANDROID_MAJOR >= 9
-            buffer->meta_data().setInt64(kKeyTime, timeUs);
+            MetaDataBase *meta_data = &buffer->meta_data();
 #else
-            buffer->meta_data()->setInt64(kKeyTime, timeUs);
+            MetaDataBase *meta_data = buffer->meta_data();
 #endif
+            if (flags & MediaCodec::BUFFER_FLAG_CODECCONFIG) {
+                meta_data->setInt32(kKeyIsCodecConfig, true);
+                meta_data->setInt64(kKeyTime, 0LL);
+            } else {
+                meta_data->setInt64(kKeyTime, timeUs);
+            }
+            if (flags & MediaCodec::BUFFER_FLAG_SYNCFRAME) {
+                meta_data->setInt32(kKeyIsSyncFrame, true);
+            }
+
             Mutexed<Output>::Locked me(mOutput);
             me->mBufferQueue.push_back(buffer);
             mCodec->releaseOutputBuffer(index);

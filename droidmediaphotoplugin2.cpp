@@ -133,12 +133,13 @@ struct DroidMediaPhotoCamera : public PhotoBackendCamera {
 
     android::Mutex droid_sequence_lock;
     android::Mutex metadata_lock;
+    int trigger_seq_id = -1;
     int picture_seq_id = -1;
-    bool ae_precapture = false;
-    bool ae_precapture_locked = false;
-    bool ae_unlock = false;
-    bool ae_unlock_wait_lock = false;
-    bool af_active_scan = false;
+    uint8_t last_ae_state = ACAMERA_CONTROL_AE_STATE_INACTIVE;
+    uint8_t last_af_state = ACAMERA_CONTROL_AF_STATE_INACTIVE;
+    PhotoControlFocusMode current_focus_mode = PHOTO_AUTO_FOCUS;
+    bool disable_continuous_af = false;
+    bool owns_repeating_request_streams = false;
     std::deque<DroidMediaPhotoStream *> stopping_streams;
     std::unordered_map<int, std::vector<DroidMediaPhotoStream *> *> active_stream_lists;
 
@@ -467,6 +468,53 @@ static void cleanup_stream(DroidMediaPhotoCamera *camera, PhotoStream *pstream)
     stream->metadata_queue.clear();
 }
 
+static bool resubmit_repeating_request(DroidMediaPhotoCamera *camera)
+{
+    android::AutoMutex lock(camera->droid_sequence_lock);
+
+    if (!camera->repeating_request) {
+        return false;
+    }
+
+    void *user_context = nullptr;
+    ACaptureRequest_getUserContext(camera->repeating_request, &user_context);
+    std::vector<DroidMediaPhotoStream *> *streams =
+        static_cast<std::vector<DroidMediaPhotoStream *> *>(user_context);
+
+    if (!camera->owns_repeating_request_streams) {
+        // Copy to avoid use-after-free when the current sequence completes
+        streams = new std::vector<DroidMediaPhotoStream *>(*streams);
+        ACaptureRequest_setUserContext(camera->repeating_request, streams);
+    }
+
+    int seq_id = -1;
+    camera_status_t status = ACameraCaptureSession_setRepeatingRequest(camera->session,
+            &camera->capture_callbacks, 1, &camera->repeating_request, &seq_id);
+    if (status == ACAMERA_OK) {
+        // Freed via active_stream_lists from completion callback
+        camera->owns_repeating_request_streams = false;
+    } else {
+        ALOGE("Failed to set repeating request");
+        // Freed or recycled by next attempt
+        camera->owns_repeating_request_streams = true;
+        return false;
+    }
+
+    camera->active_stream_lists[seq_id] = streams;
+    ALOGD("bound sequence id %d: %p - repeating request", seq_id, streams);
+
+    for (int i = 0; i < camera->photo_camera->num_streams; i++) {
+        PhotoStream *pstream = camera->photo_camera->streams[i];
+        DroidMediaPhotoStream *stream = static_cast<DroidMediaPhotoStream *>(pstream->backend);
+
+        if (pstream->running) {
+            stream->sequence_id = seq_id;
+        }
+    }
+
+    return true;
+}
+
 static bool update_repeating_request(DroidMediaPhotoCamera *camera)
 {
     PhotoCamera *pcamera = camera->photo_camera;
@@ -509,66 +557,40 @@ static bool update_repeating_request(DroidMediaPhotoCamera *camera)
         }
     }
 
-    if (recording) {
-        camera->repeating_request = camera->recording_request;
-    } else if (preview) {
-        camera->repeating_request = camera->preview_request;
-    } else {
-        camera->repeating_request = nullptr;
+    {
+        android::AutoMutex lock(camera->droid_sequence_lock);
 
-        camera->plugin_interface->begin_state_change(camera);
-
-        bool changed = false;
-
-        camera->ae_precapture = false;
-        camera->af_active_scan = false;
-
-        if (pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AE] != PHOTO_CONTROL_STATE_DISABLED) {
-            pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AE] = PHOTO_CONTROL_STATE_DISABLED;
-            changed = true;
-        }
-        if (pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AF] != PHOTO_CONTROL_STATE_DISABLED) {
-            pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AF] = PHOTO_CONTROL_STATE_DISABLED;
-            changed = true;
+        if (camera->repeating_request && camera->owns_repeating_request_streams) {
+            void *user_context = nullptr;
+            ACaptureRequest_getUserContext(camera->repeating_request, &user_context);
+            if (user_context) {
+                std::vector<DroidMediaPhotoStream *> *old_streams =
+                    static_cast<std::vector<DroidMediaPhotoStream *> *>(user_context);
+                delete old_streams;
+            }
         }
 
-        camera->plugin_interface->end_state_change(camera, changed);
+        if (recording) {
+            camera->repeating_request = camera->recording_request;
+        } else if (preview) {
+            camera->repeating_request = camera->preview_request;
+        } else {
+            camera->repeating_request = nullptr;
 
-        ACameraCaptureSession_stopRepeating(camera->session);
-        return true;
+            ACameraCaptureSession_stopRepeating(camera->session);
+            return true;
+        }
+
+        ACaptureRequest_setUserContext(camera->repeating_request, streams);
+        // Consumed by resubmit_repeating_request
+        camera->owns_repeating_request_streams = true;
     }
-
-    ACaptureRequest_setUserContext(camera->repeating_request, streams);
 
     int32_t fps_range[2] = { min_fps, max_fps };
     ACaptureRequest_setEntry_i32(camera->repeating_request, ACAMERA_CONTROL_AE_TARGET_FPS_RANGE,
                                  2, fps_range);
 
-    android::AutoMutex lock(camera->droid_sequence_lock);
-
-    int seq_id = -1;
-    camera_status_t status = ACameraCaptureSession_setRepeatingRequest(camera->session,
-            &camera->capture_callbacks, 1, &camera->repeating_request, &seq_id);
-    if (status != ACAMERA_OK) {
-        ALOGE("Failed to set repeating request");
-        ACaptureRequest_setUserContext(camera->repeating_request, nullptr);
-        delete streams;
-        return false;
-    }
-
-    camera->active_stream_lists[seq_id] = streams;
-    ALOGD("bound sequence id %d: %p - repeating request", seq_id, streams);
-
-    for (int i = 0; i < pcamera->num_streams; i++) {
-        PhotoStream *pstream = pcamera->streams[i];
-        DroidMediaPhotoStream *stream = static_cast<DroidMediaPhotoStream *>(pstream->backend);
-
-        if (pstream->running) {
-            stream->sequence_id = seq_id;
-        }
-    }
-
-    return true;
+    return resubmit_repeating_request(camera);
 }
 
 static bool convert_format(DroidMediaPhotoCamera *camera, int32_t format, unsigned int *out)
@@ -1261,6 +1283,49 @@ static void capture_session_on_capture_progressed(
     ALOGV("capture progressed");
 }
 
+static void set_ae_lock(DroidMediaPhotoCamera *camera, bool value)
+{
+    uint8_t value_u8 = value;
+
+    ACaptureRequest_setEntry_u8(camera->preview_request, ACAMERA_CONTROL_AE_LOCK, 1, &value_u8);
+    ACaptureRequest_setEntry_u8(camera->still_capture_request, ACAMERA_CONTROL_AE_LOCK, 1, &value_u8);
+    ACaptureRequest_setEntry_u8(camera->recording_request, ACAMERA_CONTROL_AE_LOCK, 1, &value_u8);
+    ACaptureRequest_setEntry_u8(camera->video_snapshot_request, ACAMERA_CONTROL_AE_LOCK, 1, &value_u8);
+}
+
+static void update_af_mode_for_request(DroidMediaPhotoCamera *camera, ACaptureRequest *request, bool is_video)
+{
+    uint8_t value_u8;
+
+    switch (camera->current_focus_mode) {
+    case PHOTO_AUTO_FOCUS:
+        if (camera->disable_continuous_af)
+            value_u8 = ACAMERA_CONTROL_AF_MODE_AUTO;
+        else if (is_video)
+            value_u8 = ACAMERA_CONTROL_AF_MODE_CONTINUOUS_VIDEO;
+        else
+            value_u8 = ACAMERA_CONTROL_AF_MODE_CONTINUOUS_PICTURE;
+        break;
+    case PHOTO_MANUAL_FOCUS:
+        value_u8 = ACAMERA_CONTROL_AF_MODE_OFF;
+        break;
+    default:
+        ALOGW("Unknown AF mode, disabling AF");
+        value_u8 = ACAMERA_CONTROL_AF_MODE_OFF;
+        break;
+    }
+    ACaptureRequest_setEntry_u8(request, ACAMERA_CONTROL_AF_MODE, 1, &value_u8);
+}
+
+static void set_af_lock(DroidMediaPhotoCamera *camera, bool lock)
+{
+    camera->disable_continuous_af = lock;
+    update_af_mode_for_request(camera, camera->preview_request, false);
+    update_af_mode_for_request(camera, camera->still_capture_request, false);
+    update_af_mode_for_request(camera, camera->recording_request, true);
+    update_af_mode_for_request(camera, camera->video_snapshot_request, true);
+}
+
 static bool process_af_result(DroidMediaPhotoCamera *camera, const ACameraMetadata *result)
 {
     PhotoCamera *pcamera = camera->photo_camera;
@@ -1269,56 +1334,23 @@ static bool process_af_result(DroidMediaPhotoCamera *camera, const ACameraMetada
 
     PhotoControlLockState lock_state = pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AF];
 
-    if (lock_state == PHOTO_CONTROL_STATE_PENDING) {
-        status = ACameraMetadata_getConstEntry(result, ACAMERA_CONTROL_AF_TRIGGER, &entry);
-        if (status == ACAMERA_OK && entry.count == 1 &&
-                entry.data.u8[0] == ACAMERA_CONTROL_AF_TRIGGER_START) {
-            ALOGD("got first result for AF precapture");
-            camera->af_active_scan = true;
-        } else {
-            ALOGD("waiting for AF precapture start");
-            return false;
-        }
-    }
-
-    if (lock_state == PHOTO_CONTROL_STATE_UNLOCKING) {
-        status = ACameraMetadata_getConstEntry(result, ACAMERA_CONTROL_AF_TRIGGER, &entry);
-        if (status == ACAMERA_OK && entry.count == 1 &&
-                entry.data.u8[0] == ACAMERA_CONTROL_AF_TRIGGER_CANCEL) {
-            ALOGD("AF precapture cancel complete");
-        } else {
-            ALOGD("waiting for AF precapture cancel");
-            return false;
-        }
-    }
-
     status = ACameraMetadata_getConstEntry(result, ACAMERA_CONTROL_AF_STATE, &entry);
     if (status == ACAMERA_OK && entry.count == 1) {
-        uint8_t af_state = entry.data.u8[0];
-        ALOGV("af_lock_state %d, new AF state %d", lock_state, af_state);
+        camera->last_af_state = entry.data.u8[0];
+        __ALOGV("\t\t\taf_lock_state %d, new AF state %d", lock_state, camera->last_af_state);
 
-        switch (af_state) {
-        case ACAMERA_CONTROL_AF_STATE_INACTIVE:
-            lock_state = PHOTO_CONTROL_STATE_DISABLED;
-            break;
-        case ACAMERA_CONTROL_AF_STATE_PASSIVE_FOCUSED:
-        case ACAMERA_CONTROL_AF_STATE_PASSIVE_UNFOCUSED:
-            lock_state = PHOTO_CONTROL_STATE_UNLOCKED;
-            break;
+        switch (camera->last_af_state) {
         case ACAMERA_CONTROL_AF_STATE_FOCUSED_LOCKED:
         case ACAMERA_CONTROL_AF_STATE_NOT_FOCUSED_LOCKED:
-            camera->af_active_scan = false;
-            lock_state = PHOTO_CONTROL_STATE_LOCKED;
+            if (lock_state == PHOTO_CONTROL_STATE_SEARCHING) {
+                __ALOGV("\t\t\t-> locked");
+                pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AF] =
+                    PHOTO_CONTROL_STATE_LOCKED;
+                return true;
+            }
             break;
         default:
-            lock_state = PHOTO_CONTROL_STATE_SEARCHING;
             break;
-        }
-
-        if (lock_state != pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AF]) {
-            ALOGV("-> af_lock_state %d", lock_state);
-            pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AF] = lock_state;
-            return true;
         }
     }
 
@@ -1333,116 +1365,35 @@ static bool process_ae_result(DroidMediaPhotoCamera *camera, const ACameraMetada
 
     PhotoControlLockState lock_state = pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AE];
 
-    if (lock_state == PHOTO_CONTROL_STATE_PENDING && !camera->ae_precapture) {
-        status = ACameraMetadata_getConstEntry(result,
-                ACAMERA_CONTROL_AE_PRECAPTURE_TRIGGER, &entry);
-        if (status == ACAMERA_OK && entry.count == 1 &&
-                entry.data.u8[0] == ACAMERA_CONTROL_AE_PRECAPTURE_TRIGGER_START) {
-            ALOGD("got first result for AE precapture");
-            camera->ae_precapture = true;
-            camera->ae_precapture_locked = false;
-        } else {
-            ALOGD("waiting for AE precapture start");
-            return false;
-        }
-    }
-
-    if (lock_state == PHOTO_CONTROL_STATE_UNLOCKING && !camera->ae_unlock) {
-        status = ACameraMetadata_getConstEntry(result,
-                ACAMERA_CONTROL_AE_PRECAPTURE_TRIGGER, &entry);
-        if (status == ACAMERA_OK && entry.count == 1 &&
-                entry.data.u8[0] == ACAMERA_CONTROL_AE_PRECAPTURE_TRIGGER_CANCEL) {
-            ALOGD("AE precapture cancel complete");
-        } else {
-            ALOGD("waiting for AE precapture cancel");
-            return false;
-        }
-    }
-
-    if (camera->ae_unlock_wait_lock) {
-        status = ACameraMetadata_getConstEntry(result, ACAMERA_CONTROL_AE_LOCK, &entry);
-        if (status == ACAMERA_OK && entry.count == 1 &&
-                entry.data.u8[0] == ACAMERA_CONTROL_AE_LOCK_ON) {
-            ALOGD("found AE lock");
-            camera->ae_unlock_wait_lock = false;
-        } else {
-            ALOGD("waiting for AE lock before unlock");
-            return false;
-        }
-    }
-
     status = ACameraMetadata_getConstEntry(result, ACAMERA_CONTROL_AE_STATE, &entry);
     if (status == ACAMERA_OK && entry.count == 1) {
-        uint8_t ae_state = entry.data.u8[0];
-        ALOGV("ae_lock_state %d, new AE state %d", lock_state, ae_state);
+        camera->last_ae_state = entry.data.u8[0];
+        __ALOGV("ae_lock_state %d, new AE state %d", lock_state, camera->last_ae_state);
 
-        if (camera->ae_unlock) {
-            if (ae_state == ACAMERA_CONTROL_AE_STATE_LOCKED) {
-                ALOGD("waiting for AE unlock");
-                return false;
-            } else {
-                ALOGD("AE unlock complete");
-                camera->ae_unlock = false;
+        switch (camera->last_ae_state) {
+        case ACAMERA_CONTROL_AE_STATE_CONVERGED:
+        case ACAMERA_CONTROL_AE_STATE_FLASH_REQUIRED:
+            if (lock_state == PHOTO_CONTROL_STATE_SEARCHING) {
+                __ALOGV("-> settled");
+                // Enforce lock now that precapture has settled. LOCKED is not
+                // fully accurate here, see the comment in process_ae_trigger.
+                pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AE] =
+                    PHOTO_CONTROL_STATE_LOCKED;
+                set_ae_lock(camera, true);
+                resubmit_repeating_request(camera);
+                return true;
             }
-        }
-
-        if (lock_state == PHOTO_CONTROL_STATE_FORCE_LOCKING) {
-            if (ae_state == ACAMERA_CONTROL_AE_STATE_LOCKED) {
-                ALOGD("AE lock complete");
-                lock_state = PHOTO_CONTROL_STATE_FORCE_LOCKED;
-            } else {
-                ALOGD("waiting for AE lock");
-                return false;
+            break;
+        case ACAMERA_CONTROL_AE_STATE_LOCKED:
+            if (lock_state == PHOTO_CONTROL_STATE_SEARCHING) {
+                __ALOGV("-> locked");
+                pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AE] =
+                    PHOTO_CONTROL_STATE_LOCKED;
+                return true;
             }
-        } else if (camera->ae_precapture) {
-            switch (ae_state) {
-            case ACAMERA_CONTROL_AE_STATE_INACTIVE:
-                lock_state = PHOTO_CONTROL_STATE_DISABLED;
-                if (camera->ae_precapture_locked) {
-                    camera->ae_precapture = false;
-                    ALOGD("AE lock lost, inactive");
-                }
-                break;
-            case ACAMERA_CONTROL_AE_STATE_CONVERGED:
-            case ACAMERA_CONTROL_AE_STATE_FLASH_REQUIRED:
-            case ACAMERA_CONTROL_AE_STATE_LOCKED:
-                camera->ae_precapture_locked = true;
-                if (lock_state != PHOTO_CONTROL_STATE_FORCE_LOCKED) {
-                    lock_state = PHOTO_CONTROL_STATE_LOCKED;
-                }
-                break;
-            default:
-                lock_state = PHOTO_CONTROL_STATE_SEARCHING;
-                if (camera->ae_precapture_locked) {
-                    ALOGD("AE lock lost, searching");
-                    camera->ae_precapture = false;
-                }
-                break;
-            }
-        } else {
-            switch (ae_state) {
-            case ACAMERA_CONTROL_AE_STATE_INACTIVE:
-                lock_state = PHOTO_CONTROL_STATE_DISABLED;
-                break;
-            case ACAMERA_CONTROL_AE_STATE_CONVERGED:
-            case ACAMERA_CONTROL_AE_STATE_FLASH_REQUIRED:
-                lock_state = PHOTO_CONTROL_STATE_UNLOCKED;
-                break;
-            case ACAMERA_CONTROL_AE_STATE_LOCKED:
-                if (lock_state != PHOTO_CONTROL_STATE_FORCE_LOCKED) {
-                    lock_state = PHOTO_CONTROL_STATE_LOCKED;
-                }
-                break;
-            default:
-                lock_state = PHOTO_CONTROL_STATE_SEARCHING;
-                break;
-            }
-        }
-
-        if (lock_state != pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AE]) {
-            ALOGV("-> ae_lock_state %d", lock_state);
-            pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AE] = lock_state;
-            return true;
+            break;
+        default:
+            break;
         }
     }
 
@@ -1504,6 +1455,84 @@ static void capture_session_on_capture_failed(
     }
 }
 
+static bool process_af_triggered(DroidMediaPhotoCamera *camera)
+{
+    PhotoCamera *pcamera = camera->photo_camera;
+    PhotoControlLockState lock_state = pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AF];
+
+    if (lock_state == PHOTO_CONTROL_STATE_FORCE_LOCKING) {
+        // AF_CANCEL + focus mode change -> assume immediately INACTIVE
+        lock_state = PHOTO_CONTROL_STATE_LOCKED;
+    } else if (lock_state == PHOTO_CONTROL_STATE_PENDING) {
+        switch (camera->last_af_state) {
+        case ACAMERA_CONTROL_AF_STATE_ACTIVE_SCAN:
+            lock_state = PHOTO_CONTROL_STATE_SEARCHING;
+            break;
+        case ACAMERA_CONTROL_AF_STATE_FOCUSED_LOCKED:
+        case ACAMERA_CONTROL_AF_STATE_NOT_FOCUSED_LOCKED:
+            lock_state = PHOTO_CONTROL_STATE_LOCKED;
+            break;
+        default:
+            lock_state = PHOTO_CONTROL_STATE_UNLOCKED;
+            // Unexpected unlock, sync control
+            set_af_lock(camera, false);
+            resubmit_repeating_request(camera);
+            break;
+        }
+    } else {
+        return false;
+    }
+
+    __ALOGV("\t\t\t-> sync %d", lock_state);
+    pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AF] = lock_state;
+
+    return true;
+}
+
+static bool process_ae_triggered(DroidMediaPhotoCamera *camera)
+{
+    PhotoCamera *pcamera = camera->photo_camera;
+    PhotoControlLockState lock_state = pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AE];
+
+    if (lock_state == PHOTO_CONTROL_STATE_FORCE_LOCKING) {
+        // precapture CANCEL + AE_LOCK on -> assume immediately LOCKED
+        lock_state = PHOTO_CONTROL_STATE_LOCKED;
+    } else if (lock_state == PHOTO_CONTROL_STATE_PENDING) {
+        switch (camera->last_ae_state) {
+        case ACAMERA_CONTROL_AE_STATE_PRECAPTURE:
+        case ACAMERA_CONTROL_AE_STATE_SEARCHING:
+            lock_state = PHOTO_CONTROL_STATE_SEARCHING;
+            break;
+        case ACAMERA_CONTROL_AE_STATE_CONVERGED:
+        case ACAMERA_CONTROL_AE_STATE_FLASH_REQUIRED:
+            // Enforce the lock. This only takes effect after several frames,
+	    // and the AE algorithm may still perform minor changes even after
+	    // it has completed a precapture sequence. Report LOCKED anyway
+	    // to avoid delaying the capture too much.
+            lock_state = PHOTO_CONTROL_STATE_LOCKED;
+            set_ae_lock(camera, true);
+            resubmit_repeating_request(camera);
+            break;
+        case ACAMERA_CONTROL_AE_STATE_LOCKED:
+            lock_state = PHOTO_CONTROL_STATE_LOCKED;
+            break;
+        default:
+            lock_state = PHOTO_CONTROL_STATE_UNLOCKED;
+            // Unexpected unlock, sync control
+            set_ae_lock(camera, false);
+            resubmit_repeating_request(camera);
+            break;
+        }
+    } else {
+        return false;
+    }
+
+    __ALOGV("-> sync %d", lock_state);
+    pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AE] = lock_state;
+
+    return true;
+}
+
 static void capture_session_on_capture_sequence_completed(
     void *context, ACameraCaptureSession *session,
     int sequenceId, int64_t frameNumber)
@@ -1524,6 +1553,15 @@ static void capture_session_on_capture_sequence_completed(
         ALOGD("erase %p", it->second);
         delete it->second;
         camera->active_stream_lists.erase(it);
+    }
+
+    if (sequenceId == camera->trigger_seq_id) {
+        camera->trigger_seq_id = -1;
+        camera->plugin_interface->begin_state_change(camera);
+        bool changed = false;
+        changed |= process_ae_triggered(camera);
+        changed |= process_af_triggered(camera);
+        camera->plugin_interface->end_state_change(camera, changed);
     }
 
     if (sequenceId == camera->picture_seq_id) {
@@ -1557,6 +1595,15 @@ static void capture_session_on_capture_sequence_abort(
         ALOGD("erase %p", it->second);
         delete it->second;
         camera->active_stream_lists.erase(it);
+    }
+
+    if (sequenceId == camera->trigger_seq_id) {
+        camera->trigger_seq_id = -1;
+        camera->plugin_interface->begin_state_change(camera);
+        bool changed = false;
+        changed |= process_ae_triggered(camera);
+        changed |= process_af_triggered(camera);
+        camera->plugin_interface->end_state_change(camera, changed);
     }
 
     if (sequenceId == camera->picture_seq_id) {
@@ -1752,6 +1799,26 @@ static bool dmp_camera_open(PhotoCamera *pcamera)
         return false;
     }
 
+    ACameraMetadata_const_entry entry;
+
+    status = ACaptureRequest_getConstEntry(camera->preview_request,
+                                           ACAMERA_CONTROL_AE_MODE, &entry);
+    if (status == ACAMERA_OK && entry.data.u8[0] != ACAMERA_CONTROL_AE_MODE_OFF) {
+        pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AE] = PHOTO_CONTROL_STATE_UNLOCKED;
+    } else {
+        pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AE] = PHOTO_CONTROL_STATE_DISABLED;
+    }
+
+    status = ACaptureRequest_getConstEntry(camera->preview_request,
+                                           ACAMERA_CONTROL_AF_MODE, &entry);
+    if (status == ACAMERA_OK && entry.data.u8[0] != ACAMERA_CONTROL_AF_MODE_OFF) {
+        pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AF] = PHOTO_CONTROL_STATE_UNLOCKED;
+        camera->current_focus_mode = PHOTO_AUTO_FOCUS;
+    } else {
+        pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AF] = PHOTO_CONTROL_STATE_DISABLED;
+        camera->current_focus_mode = PHOTO_MANUAL_FOCUS;
+    }
+
     return true;
 }
 
@@ -1887,12 +1954,7 @@ static void dmp_camera_query_focus_modes(PhotoCamera *pcamera)
         for (int i = 0; i < entry.count; i++) {
             switch (entry.data.u8[i]) {
             case ACAMERA_CONTROL_AF_MODE_AUTO:
-            case ACAMERA_CONTROL_AF_MODE_MACRO:
                 photo_set_bit(pcamera->focus_mode_info, PHOTO_AUTO_FOCUS);
-                break;
-            case ACAMERA_CONTROL_AF_MODE_CONTINUOUS_VIDEO:
-            case ACAMERA_CONTROL_AF_MODE_CONTINUOUS_PICTURE:
-                photo_set_bit(pcamera->focus_mode_info, PHOTO_CONTINUOUS_AUTO_FOCUS);
                 break;
             case ACAMERA_CONTROL_AF_MODE_OFF:
                 photo_set_bit(pcamera->focus_mode_info, PHOTO_MANUAL_FOCUS);
@@ -2088,8 +2150,9 @@ static int32_t *convert_metering_areas(PhotoControlMeteringAreas *areas, const i
     return values;
 }
 
-static void update_params_for_request(PhotoCamera *pcamera, ACaptureRequest *request, bool is_video)
+static void update_params_for_request(DroidMediaPhotoCamera *camera, ACaptureRequest *request)
 {
+    PhotoCamera *pcamera = camera->photo_camera;
     uint8_t value_u8;
 
     if (photo_check_bit(pcamera->dirty, PHOTO_CONTROL_AE_COMPENSATION)) {
@@ -2242,25 +2305,7 @@ static void update_params_for_request(PhotoCamera *pcamera, ACaptureRequest *req
     }
 
     if (photo_check_bit(pcamera->dirty, PHOTO_CONTROL_FOCUS_MODE)) {
-        switch (pcamera->focus_mode) {
-        case PHOTO_AUTO_FOCUS:
-            value_u8 = ACAMERA_CONTROL_AF_MODE_AUTO;
-            break;
-        case PHOTO_CONTINUOUS_AUTO_FOCUS:
-            if (is_video)
-                value_u8 = ACAMERA_CONTROL_AF_MODE_CONTINUOUS_VIDEO;
-            else
-                value_u8 = ACAMERA_CONTROL_AF_MODE_CONTINUOUS_PICTURE;
-            break;
-        case PHOTO_MANUAL_FOCUS:
-            value_u8 = ACAMERA_CONTROL_AF_MODE_OFF;
-            break;
-        default:
-            ALOGW("Unknown AF mode, disabling AF");
-            value_u8 = ACAMERA_CONTROL_AF_MODE_OFF;
-            break;
-        }
-        ACaptureRequest_setEntry_u8(request, ACAMERA_CONTROL_AF_MODE, 1, &value_u8);
+        camera->current_focus_mode = (PhotoControlFocusMode)pcamera->focus_mode;
     }
 
     if (photo_check_bit(pcamera->dirty, PHOTO_CONTROL_LENS_FOCUS)) {
@@ -2341,16 +2386,84 @@ static void update_params_for_request(PhotoCamera *pcamera, ACaptureRequest *req
     }
 }
 
+static bool reset_lock(PhotoCamera *pcamera, PhotoControlLockId lock_id, bool disabled)
+{
+    PhotoControlLockState lock_state = pcamera->lock_states[lock_id];
+
+    if (lock_state != PHOTO_CONTROL_STATE_UNLOCKED && !disabled) {
+        pcamera->lock_states[lock_id] = PHOTO_CONTROL_STATE_UNLOCKED;
+        return true;
+    }
+    if (lock_state != PHOTO_CONTROL_STATE_DISABLED && disabled) {
+        pcamera->lock_states[lock_id] = PHOTO_CONTROL_STATE_DISABLED;
+        return true;
+    }
+
+    return false;
+}
+
 static void dmp_camera_update_params(PhotoCamera *pcamera)
 {
     DroidMediaPhotoCamera *camera = static_cast<DroidMediaPhotoCamera *>(pcamera->backend);
 
-    update_params_for_request(pcamera, camera->preview_request, false);
-    update_params_for_request(pcamera, camera->still_capture_request, false);
-    update_params_for_request(pcamera, camera->recording_request, true);
-    update_params_for_request(pcamera, camera->video_snapshot_request, true);
+    update_params_for_request(camera, camera->preview_request);
+    update_params_for_request(camera, camera->still_capture_request);
+    update_params_for_request(camera, camera->recording_request);
+    update_params_for_request(camera, camera->video_snapshot_request);
 
-    update_repeating_request(camera);
+    camera->plugin_interface->begin_state_change(camera);
+    bool changed = false;
+
+    if (photo_check_bit(pcamera->dirty, PHOTO_CONTROL_EXPOSURE_MODE)) {
+        set_ae_lock(camera, false);
+        changed |= reset_lock(pcamera, PHOTO_CONTROL_LOCK_ID_AE,
+                              pcamera->exposure_mode == PHOTO_MANUAL_EXPOSURE);
+    }
+
+    if (photo_check_bit(pcamera->dirty, PHOTO_CONTROL_FOCUS_MODE)) {
+        camera->disable_continuous_af = false;
+        update_af_mode_for_request(camera, camera->preview_request, false);
+        update_af_mode_for_request(camera, camera->still_capture_request, false);
+        update_af_mode_for_request(camera, camera->recording_request, true);
+        update_af_mode_for_request(camera, camera->video_snapshot_request, true);
+        changed |= reset_lock(pcamera, PHOTO_CONTROL_LOCK_ID_AF,
+                              pcamera->focus_mode == PHOTO_MANUAL_FOCUS);
+    }
+
+    camera->plugin_interface->end_state_change(camera, changed);
+
+    resubmit_repeating_request(camera);
+}
+
+static void submit_trigger(DroidMediaPhotoCamera *camera, ACaptureRequest *request)
+{
+    android::AutoMutex lock(camera->droid_sequence_lock);
+
+    if (!camera->repeating_request) {
+        return;
+    }
+
+    // Copy stream list to avoid use-after-free on repeating sequence completion
+    void *user_context = nullptr;
+    std::vector<DroidMediaPhotoStream *> *streams = nullptr;
+    ACaptureRequest_getUserContext(camera->repeating_request, &user_context);
+    if (user_context) {
+        streams = static_cast<std::vector<DroidMediaPhotoStream *> *>(user_context);
+        streams = new std::vector<DroidMediaPhotoStream *>(*streams);
+        ACaptureRequest_setUserContext(request, streams);
+    }
+
+    int seq_id = -1;
+    camera_status_t status = ACameraCaptureSession_capture(camera->session,
+            &camera->capture_callbacks, 1, &request, &seq_id);
+    if (status == ACAMERA_OK) {
+        camera->active_stream_lists[seq_id] = streams;
+        camera->trigger_seq_id = seq_id;
+        ALOGD("bound sequence id %d: %p - trigger", seq_id, streams);
+    } else {
+        ALOGE("Capture request for trigger failed");
+        delete streams;
+    }
 }
 
 static void dmp_camera_trigger(PhotoCamera *pcamera, PhotoControlLockMask locks)
@@ -2374,10 +2487,12 @@ static void dmp_camera_trigger(PhotoCamera *pcamera, PhotoControlLockMask locks)
 
     if (locks & PHOTO_CONTROL_LOCK_BIT_AE) {
         PhotoControlLockState lock_state = pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AE];
-        if (lock_state != PHOTO_CONTROL_STATE_PENDING && !camera->ae_precapture &&
-                lock_state != PHOTO_CONTROL_STATE_FORCE_LOCKED) {
+
+        if (lock_state != PHOTO_CONTROL_STATE_DISABLED) {
             uint8_t value = ACAMERA_CONTROL_AE_PRECAPTURE_TRIGGER_START;
             ACaptureRequest_setEntry_u8(request, ACAMERA_CONTROL_AE_PRECAPTURE_TRIGGER, 1, &value);
+            value = 0; // Unlock AE to start full sequence
+            ACaptureRequest_setEntry_u8(request, ACAMERA_CONTROL_AE_LOCK, 1, &value);
 
             pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AE] = PHOTO_CONTROL_STATE_PENDING;
             changed = true;
@@ -2385,52 +2500,42 @@ static void dmp_camera_trigger(PhotoCamera *pcamera, PhotoControlLockMask locks)
     }
 
     if (locks & PHOTO_CONTROL_LOCK_BIT_AF) {
-        ACameraMetadata_const_entry entry;
+        PhotoControlLockState lock_state = pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AF];
 
-        status = ACaptureRequest_getConstEntry(request, ACAMERA_CONTROL_AF_MODE, &entry);
-        if (status == ACAMERA_OK && entry.data.u8[0] != ACAMERA_CONTROL_AF_MODE_OFF) {
-            PhotoControlLockState lock_state = pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AF];
-            if (lock_state != PHOTO_CONTROL_STATE_PENDING && !camera->af_active_scan &&
-                    lock_state != PHOTO_CONTROL_STATE_LOCKED) {
-                uint8_t value = ACAMERA_CONTROL_AF_TRIGGER_START;
-                ACaptureRequest_setEntry_u8(request, ACAMERA_CONTROL_AF_TRIGGER, 1, &value);
+        if (lock_state != PHOTO_CONTROL_STATE_DISABLED) {
+            uint8_t value = ACAMERA_CONTROL_AF_TRIGGER_START;
+            ACaptureRequest_setEntry_u8(request, ACAMERA_CONTROL_AF_TRIGGER, 1, &value);
+            // CAF->AUTO switch is explicitly allowed in combination with
+            // AF_TRIGGER and should not reset the current focus
+            camera->disable_continuous_af = true;
+            update_af_mode_for_request(camera, request,
+                                       camera->repeating_request == camera->recording_request ||
+                                       camera->repeating_request == camera->video_snapshot_request);
 
-                pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AF] = PHOTO_CONTROL_STATE_PENDING;
-                changed = true;
-            }
+            pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AF] = PHOTO_CONTROL_STATE_PENDING;
+            changed = true;
         }
+    }
+
+    if (changed) {
+        submit_trigger(camera, request);
+
+        if (locks & PHOTO_CONTROL_LOCK_BIT_AE) {
+            // We unlocked AE above, keep unlocked until precapture is complete
+            set_ae_lock(camera, false);
+        }
+
+        if (locks & PHOTO_CONTROL_LOCK_BIT_AF) {
+            // We set AF to non-continuous above
+            set_af_lock(camera, true);
+        }
+
+        resubmit_repeating_request(camera);
     }
 
     camera->plugin_interface->end_state_change(camera, changed);
 
-    // Copy stream list to avoid use-after-free on repeating sequence completion
-    void *user_context = nullptr;
-    std::vector<DroidMediaPhotoStream *> *streams = nullptr;
-    ACaptureRequest_getUserContext(request, &user_context);
-    if (user_context) {
-        streams = static_cast<std::vector<DroidMediaPhotoStream *> *>(user_context);
-        streams = new std::vector<DroidMediaPhotoStream *>(*streams);
-        ACaptureRequest_setUserContext(request, streams);
-    }
-
-    int seq_id = -1;
-    status = ACameraCaptureSession_capture(camera->session, &camera->capture_callbacks,
-                                           1, &request, &seq_id);
-    if (status == ACAMERA_OK) {
-        android::AutoMutex lock(camera->droid_sequence_lock);
-        camera->active_stream_lists[seq_id] = streams;
-        ALOGD("bound sequence id %d: %p - lock trigger", seq_id, streams);
-    } else {
-        ALOGE("Capture request for lock trigger failed");
-        delete streams;
-    }
-}
-
-static void set_ae_lock_for_request(PhotoCamera *pcamera, ACaptureRequest *request, bool value)
-{
-    uint8_t value_u8 = value;
-
-    ACaptureRequest_setEntry_u8(request, ACAMERA_CONTROL_AE_LOCK, 1, &value_u8);
+    ACaptureRequest_free(request);
 }
 
 static void dmp_camera_force_lock(PhotoCamera *pcamera, PhotoControlLockMask locks)
@@ -2441,21 +2546,64 @@ static void dmp_camera_force_lock(PhotoCamera *pcamera, PhotoControlLockMask loc
         return;
     }
 
+    ACaptureRequest *request = ACaptureRequest_copy(camera->repeating_request);
+    if (!request) {
+        return;
+    }
+
     camera->plugin_interface->begin_state_change(camera);
 
     bool changed = false;
 
     if (locks & PHOTO_CONTROL_LOCK_BIT_AE) {
-        pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AE] = PHOTO_CONTROL_STATE_FORCE_LOCKING;
-        changed = true;
+        PhotoControlLockState lock_state = pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AE];
 
-        set_ae_lock_for_request(pcamera, camera->preview_request, true);
-        set_ae_lock_for_request(pcamera, camera->still_capture_request, true);
-        set_ae_lock_for_request(pcamera, camera->recording_request, true);
-        set_ae_lock_for_request(pcamera, camera->video_snapshot_request, true);
+        if (lock_state != PHOTO_CONTROL_STATE_LOCKED &&
+                lock_state != PHOTO_CONTROL_STATE_DISABLED) {
+            uint8_t value = ACAMERA_CONTROL_AE_PRECAPTURE_TRIGGER_CANCEL;
+            ACaptureRequest_setEntry_u8(request, ACAMERA_CONTROL_AE_PRECAPTURE_TRIGGER, 1, &value);
+            value = 0;
+            ACaptureRequest_setEntry_u8(request, ACAMERA_CONTROL_AE_LOCK, 1, &value);
+
+            pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AE] = PHOTO_CONTROL_STATE_FORCE_LOCKING;
+            changed = true;
+        }
+    }
+
+    if (locks & PHOTO_CONTROL_LOCK_BIT_AF) {
+        PhotoControlLockState lock_state = pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AF];
+
+        if (lock_state != PHOTO_CONTROL_STATE_LOCKED &&
+                lock_state != PHOTO_CONTROL_STATE_DISABLED) {
+            uint8_t value = ACAMERA_CONTROL_AF_TRIGGER_CANCEL;
+            ACaptureRequest_setEntry_u8(request, ACAMERA_CONTROL_AF_TRIGGER, 1, &value);
+            camera->disable_continuous_af = true;
+            update_af_mode_for_request(camera, request,
+                                       camera->repeating_request == camera->recording_request ||
+                                       camera->repeating_request == camera->video_snapshot_request);
+
+            pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AF] = PHOTO_CONTROL_STATE_FORCE_LOCKING;
+            changed = true;
+        }
+    }
+
+    if (changed) {
+        submit_trigger(camera, request);
+
+        if (locks & PHOTO_CONTROL_LOCK_BIT_AF) {
+            set_af_lock(camera, true);
+        }
+
+        if (locks & PHOTO_CONTROL_LOCK_BIT_AE) {
+            set_ae_lock(camera, true);
+        }
+
+        resubmit_repeating_request(camera);
     }
 
     camera->plugin_interface->end_state_change(camera, changed);
+
+    ACaptureRequest_free(request);
 }
 
 static void dmp_camera_unlock(PhotoCamera *pcamera, PhotoControlLockMask locks)
@@ -2477,71 +2625,53 @@ static void dmp_camera_unlock(PhotoCamera *pcamera, PhotoControlLockMask locks)
 
     if (locks & PHOTO_CONTROL_LOCK_BIT_AE) {
         PhotoControlLockState lock_state = pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AE];
-        camera->ae_unlock_wait_lock = lock_state == PHOTO_CONTROL_STATE_FORCE_LOCKING;
-        camera->ae_unlock = lock_state == PHOTO_CONTROL_STATE_FORCE_LOCKED ||
-                camera->ae_unlock_wait_lock;
 
-        // If a precapture sequence was in progress, it must be cancelled
-        // before attempting to unlock AE.
-        if (lock_state == PHOTO_CONTROL_STATE_PENDING || camera->ae_precapture) {
+        if (lock_state != PHOTO_CONTROL_STATE_UNLOCKED &&
+                lock_state != PHOTO_CONTROL_STATE_DISABLED) {
             uint8_t value = ACAMERA_CONTROL_AE_PRECAPTURE_TRIGGER_CANCEL;
             ACaptureRequest_setEntry_u8(request, ACAMERA_CONTROL_AE_PRECAPTURE_TRIGGER, 1, &value);
-            camera->ae_precapture = false;
+            value = 0;
+            ACaptureRequest_setEntry_u8(request, ACAMERA_CONTROL_AE_LOCK, 1, &value);
 
-            pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AE] = PHOTO_CONTROL_STATE_UNLOCKING;
-            changed = true;
-        } else if (camera->ae_unlock) {
-            set_ae_lock_for_request(pcamera, request, false);
-
-            pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AE] = PHOTO_CONTROL_STATE_UNLOCKING;
+            pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AE] = PHOTO_CONTROL_STATE_UNLOCKED;
             changed = true;
         }
     }
 
     if (locks & PHOTO_CONTROL_LOCK_BIT_AF) {
         PhotoControlLockState lock_state = pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AF];
-        if (lock_state == PHOTO_CONTROL_STATE_PENDING || camera->af_active_scan ||
-                lock_state == PHOTO_CONTROL_STATE_LOCKED) {
+
+        if (lock_state != PHOTO_CONTROL_STATE_UNLOCKED &&
+                lock_state != PHOTO_CONTROL_STATE_DISABLED) {
             uint8_t value = ACAMERA_CONTROL_AF_TRIGGER_CANCEL;
             ACaptureRequest_setEntry_u8(request, ACAMERA_CONTROL_AF_TRIGGER, 1, &value);
-            camera->af_active_scan = false;
+            camera->disable_continuous_af = false;
+            update_af_mode_for_request(camera, request,
+                                       camera->repeating_request == camera->recording_request ||
+                                       camera->repeating_request == camera->video_snapshot_request);
 
-            pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AF] = PHOTO_CONTROL_STATE_UNLOCKING;
+            pcamera->lock_states[PHOTO_CONTROL_LOCK_ID_AF] = PHOTO_CONTROL_STATE_UNLOCKED;
             changed = true;
         }
     }
 
-    // Copy stream list to avoid use-after-free on repeating sequence completion
-    void *user_context = nullptr;
-    std::vector<DroidMediaPhotoStream *> *streams = nullptr;
-    ACaptureRequest_getUserContext(request, &user_context);
-    if (user_context) {
-        streams = static_cast<std::vector<DroidMediaPhotoStream *> *>(user_context);
-        streams = new std::vector<DroidMediaPhotoStream *>(*streams);
-        ACaptureRequest_setUserContext(request, streams);
-    }
+    if (changed) {
+        submit_trigger(camera, request);
 
-    int seq_id = -1;
-    camera_status_t status = ACameraCaptureSession_capture(camera->session,
-                                &camera->capture_callbacks, 1, &request, &seq_id);
-    if (status == ACAMERA_OK) {
-        android::AutoMutex lock(camera->droid_sequence_lock);
-        camera->active_stream_lists[seq_id] = streams;
-        ALOGD("bound sequence id %d: %p - unlock trigger", seq_id, streams);
-    } else {
-        ALOGE("Capture request for unlock trigger failed");
-        delete streams;
-    }
+        if (locks & PHOTO_CONTROL_LOCK_BIT_AE) {
+            set_ae_lock(camera, false);
+        }
 
-    if (camera->ae_unlock) {
-        set_ae_lock_for_request(pcamera, camera->preview_request, false);
-        set_ae_lock_for_request(pcamera, camera->still_capture_request, false);
-        set_ae_lock_for_request(pcamera, camera->recording_request, false);
-        set_ae_lock_for_request(pcamera, camera->video_snapshot_request, false);
-        update_repeating_request(camera);
+        if (locks & PHOTO_CONTROL_LOCK_BIT_AF) {
+            set_af_lock(camera, false);
+        }
+
+        resubmit_repeating_request(camera);
     }
 
     camera->plugin_interface->end_state_change(camera, changed);
+
+    ACaptureRequest_free(request);
 }
 
 static PhotoStream *dmp_camera_create_stream(PhotoCamera *pcamera, PhotoStreamUsage usage)
